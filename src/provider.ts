@@ -341,11 +341,13 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                 throw new Error("Message exceeds token limit.");
             }
 
-						const maxOutputTokens = await resolveMaxOutputTokens();            requestBody = {
+            const maxOutputTokens = await resolveMaxOutputTokens();
+            requestBody = {
                 model: realModelId,
                 messages: openaiMessages,
                 stream: true,
-								max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),                temperature: options.modelOptions?.temperature ?? 0.7,
+                max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
+                temperature: options.modelOptions?.temperature ?? 0.7,
             };
 
 			// Allow-list model options

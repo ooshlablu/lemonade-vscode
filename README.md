@@ -53,7 +53,7 @@ Configure the provider in VS Code's `settings.json`:
 
 | Setting | Default | Range | Description |
 |---|---:|---:|---|
-| `lemonade.maxOutputTokens` | `16000` | 1 to 262144 | Maximum response tokens advertised to VS Code and requested from Lemonade unless the host supplies a lower `max_tokens` value. Reserve sufficient context for the prompt and tool definitions. |
+| `lemonade.maxOutputTokens` | `65536` | 1 to 262144 | Maximum response tokens advertised to VS Code and requested from Lemonade unless the host supplies a lower `max_tokens` value. Reserve sufficient context for the prompt and tool definitions. |
 | `lemonade.requestTimeout` | `300000` ms | 10000 to 3600000 ms | Total extension-to-Lemonade request timeout, including prompt processing and the complete streamed response. Increase it for long prompts or generations. |
 
 `lemonade.requestTimeout` controls the VS Code extension only. Lemonade server timeouts, backend queueing, and reverse-proxy timeouts are configured independently. The extension logs whether a request was cancelled by VS Code or by its configured timeout in the Extension Host log.
