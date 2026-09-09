@@ -11,6 +11,8 @@ import {
 
 import { convertTools, convertMessages, tryParseJSONObject, validateRequest } from "./utils";
 import type { LemonadeEndpoint, LemonadeModel, LemonadeModelsResponse } from "./types";
+import type { Logger } from "./logger";
+import { createFallbackLogger } from "./logger";
 
 const DEFAULT_BASE_URL = "http://localhost:13305/api/v1";
 const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
@@ -76,6 +78,10 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	 *  streaming response whose generation no longer matches the latest is
 	 *  discarded. */
 	private _requestGeneration = 0;
+	/** Counter for stale SSE chunks discarded in the current streaming session. Used to cap logging spam. */
+	private _staleChunkCount = 0;
+	/** Maximum number of stale chunk discard warnings to log per streaming session. */
+	private readonly _maxStaleWarnings = 5;
 	/** Buffer for assembling streamed tool calls by index. */
 	private _toolCallBuffers: Map<number, { id?: string; name?: string; args: string }> = new Map<
 		number,
@@ -107,11 +113,32 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	/** Buffer for handling control tokens that might be split across streaming chunks. */
 	private _controlTokenBuffer = "";
 
+	/** VS Code output channel for Lemonade extension logging. */
+	private readonly outputChannel: Logger;
+
+	/** Format a timestamp as HH:MM:SS.mmm */
+	private _ts(): string {
+		const now = new Date();
+		const h = String(now.getHours()).padStart(2, '0');
+		const m = String(now.getMinutes()).padStart(2, '0');
+		const s = String(now.getSeconds()).padStart(2, '0');
+		const ms = String(now.getMilliseconds()).padStart(3, '0');
+		return `${h}:${m}:${s}.${ms}`;
+	}
+
 	/**
 	 * Create a provider using the given secret storage for the server URL.
 	 * @param secrets VS Code secret storage.
+	 * @param userAgent User-Agent header value.
+	 * @param outputChannel Optional VS Code output channel for logging. Falls back to console.error.
 	 */
-	constructor(private readonly secrets: vscode.SecretStorage, private readonly userAgent: string) {}
+	constructor(
+		private readonly secrets: vscode.SecretStorage,
+		private readonly userAgent: string,
+		outputChannel?: Logger,
+	) {
+		this.outputChannel = outputChannel ?? createFallbackLogger();
+	}
 
 	/** Roughly estimate tokens for VS Code chat messages (text only) */
 	private estimateMessagesTokens(msgs: readonly vscode.LanguageModelChatMessage[]): number {
@@ -289,6 +316,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 
 		this._toolCallBuffers.clear();
 		this._completedToolCallIndices.clear();
+		this._staleChunkCount = 0;
 		this._hasEmittedAssistantText = false;
 		this._emittedBeginToolCallsHint = false;
         this._textToolParserBuffer = "";
@@ -308,10 +336,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 				try {
 					progress.report(part);
 				} catch (e) {
-					console.error("[Lemonade Model Provider] Progress.report failed", {
-						modelId: model.id,
-						error: e instanceof Error ? { name: e.name, message: e.message } : String(e),
-					});
+					this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Progress.report failed: ${e instanceof Error ? e.message : String(e)}`);
 				}
 			},
 		};
@@ -347,7 +372,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
             const tokenLimit = Math.max(1, model.maxInputTokens);
             if (inputTokenCount + toolTokenCount > tokenLimit) {
-                console.error("[Lemonade Provider] Message exceeds token limit", { total: inputTokenCount + toolTokenCount, tokenLimit });
+                this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Message exceeds token limit: ${inputTokenCount + toolTokenCount}/${tokenLimit}`);
                 throw new Error("Message exceeds token limit.");
             }
 
@@ -359,6 +384,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                 max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
                 temperature: options.modelOptions?.temperature ?? 0.7,
             };
+
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request: model=${realModelId}, messages=${openaiMessages.length}, max_tokens=${(requestBody as Record<string, unknown>).max_tokens}, temperature=${(requestBody as Record<string, unknown>).temperature}`);
 
 			// Allow-list model options
 			if (options.modelOptions) {
@@ -397,7 +424,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			    });
 			try {
 				const response = await fetch(`${baseUrl}/chat/completions`, {
-					method: "POST",
+						method: "POST",
 					headers: {
 						Authorization: `Bearer ${apiKey}`,
 						"Content-Type": "application/json",
@@ -407,9 +434,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 					signal: controller.signal,
 				});
 
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Response: status=${response.status} ${response.statusText}`);
+
 				if (!response.ok) {
 					const errorText = await response.text();
-					console.error("[Lemonade Model Provider] API error response", errorText);
+					this.outputChannel.appendLine(`[${this._ts()}] [ERROR] API error response: ${errorText}`);
 					throw new Error(
 						`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
 					);
@@ -418,17 +447,21 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 				if (!response.body) {
 					throw new Error("No response body from Lemonade API");
 				}
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
 				await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration);
 			} finally {
 				cancellationSubscription.dispose();
 				clearTimeout(timeoutId);
 			}
 		} catch (err) {
-			console.error("[Lemonade Model Provider] Chat request failed", {
-				modelId: model.id,
-				messageCount: messages.length,
-				error: err instanceof Error ? { name: err.name, message: err.message } : String(err),
-			});
+			const errMsg = err instanceof Error ? err.message : String(err);
+			// Abort errors are expected when VS Code cancels the request (user types a new message,
+			// switches models, etc.). Swallow them silently — they're not real failures.
+			if (errMsg.includes("aborted") || errMsg.includes("abort") || errMsg.includes("cancel")) {
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request aborted (VS Code LM API cancelled)`);
+				return;
+			}
+			this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Chat request failed: model=${model.id}, messages=${messages.length}, error=${errMsg}`);
 			throw err;
 		}
 	}
@@ -493,8 +526,10 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                     if (data === "[DONE]") {
                         // Check if this request is still the active one
                         if (generation !== this._requestGeneration) {
+                            this.outputChannel.appendLine(`[${this._ts()}] [WARN] [DONE] Stale request discarded (generation ${generation} vs current ${this._requestGeneration})`);
                             return; // Stale — discard entirely
                         }
+                        this.outputChannel.appendLine(`[${this._ts()}] [INFO] Stream completed with [DONE]`);
                         // Do not throw on [DONE]; any incomplete/empty buffers are ignored.
                         await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
                         // Flush any in-progress text-embedded tool call (silent if incomplete)
@@ -510,6 +545,12 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 						}
 						// Discard responses from stale requests (model was switched mid-stream)
 						if (generation !== this._requestGeneration) {
+							this._staleChunkCount++;
+							if (this._staleChunkCount <= this._maxStaleWarnings) {
+								this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stale SSE chunk discarded (generation ${generation} vs current ${this._requestGeneration})`);
+							} else if (this._staleChunkCount === this._maxStaleWarnings + 1) {
+								this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stale SSE chunk discard count exceeded ${this._maxStaleWarnings}; suppressing further warnings`);
+							}
 							continue;
 						}
                         await this.processDelta(parsed, progress);
@@ -524,9 +565,15 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             }
         } finally {
             reader.releaseLock();
+            if (token.isCancellationRequested) {
+                this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stream cancelled (VS Code LM API internal cancellation)`);
+            } else {
+                this.outputChannel.appendLine(`[${this._ts()}] [INFO] Stream reader closed (no [DONE] received)`);
+            }
             // Clean up any leftover tool call state
             this._toolCallBuffers.clear();
             this._completedToolCallIndices.clear();
+            this._staleChunkCount = 0;
             this._hasEmittedAssistantText = false;
             this._emittedBeginToolCallsHint = false;
             this._textToolParserBuffer = "";

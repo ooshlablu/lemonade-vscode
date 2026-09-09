@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { LemonadeChatModelProvider } from "./provider";
 import type { LemonadeEndpoint } from "./types";
+import { createFallbackLogger } from "./logger";
 
 const ENDPOINTS_SECRET_KEY = "lemonade.endpoints";
 
@@ -11,7 +12,12 @@ export function activate(context: vscode.ExtensionContext) {
 	// Keep UA minimal: only extension version and VS Code version
 	const ua = `lemonade-sdk/${extVersion} VSCode/${vscodeVersion}`;
 
-	const provider = new LemonadeChatModelProvider(context.secrets, ua);
+	const outputChannel = vscode.window.createOutputChannel("Lemonade");
+	context.subscriptions.push(outputChannel);
+	// Cast to Logger to avoid vscode.OutputChannel type mismatch between extension.ts (runtime vscode) and provider.ts (local vscode.d.ts)
+	const logger: import("./logger").Logger = outputChannel as unknown as import("./logger").Logger;
+
+	const provider = new LemonadeChatModelProvider(context.secrets, ua, logger);
 	// Register the Lemonade provider under the vendor id used in package.json
 	vscode.lm.registerLanguageModelChatProvider("lemonade", provider);
 
