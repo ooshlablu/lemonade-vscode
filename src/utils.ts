@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
 import type { OpenAIChatMessage, OpenAIChatRole, OpenAIFunctionToolDef, OpenAIToolCall } from "./types";
 
+/** Minimal log function type used by utility helpers. Defaults to console.error. */
+export type LogFn = (msg: string) => void;
+
 // Tool calling sanitization helpers
 
 function isIntegerLikePropertyName(propertyName: string | undefined): boolean {
@@ -143,7 +146,8 @@ function sanitizeSchema(input: unknown, propName?: string): Record<string, unkno
  */
 export function convertMessages(
 	messages: readonly vscode.LanguageModelChatRequestMessage[],
-	filterEphemeral: boolean = true
+	filterEphemeral: boolean = true,
+	log: LogFn = console.error
 ): OpenAIChatMessage[] {
 	const out: OpenAIChatMessage[] = [];
 	for (const m of messages) {
@@ -166,7 +170,7 @@ export function convertMessages(
 				toolCalls.push({ id, type: "function", function: { name: part.name, arguments: args } });
 			} else if (isToolResultPart(part)) {
 				const callId = (part as { callId?: string }).callId ?? "";
-				const content = collectToolResultText(part as { content?: ReadonlyArray<unknown> }, filterEphemeral);
+				const content = collectToolResultText(part as { content?: ReadonlyArray<unknown> }, filterEphemeral, log);
 				toolResults.push({ callId, content });
 			}
 		}
@@ -193,7 +197,7 @@ export function convertMessages(
  * Convert VS Code tool definitions to OpenAI function tool definitions.
  * @param options Request options containing tools and toolMode.
  */
-export function convertTools(options: vscode.LanguageModelChatRequestHandleOptions): {
+export function convertTools(options: vscode.LanguageModelChatRequestHandleOptions, log: LogFn = console.error): {
 	tools?: OpenAIFunctionToolDef[];
 	tool_choice?: "auto" | { type: "function"; function: { name: string } };
 } {
@@ -221,7 +225,7 @@ export function convertTools(options: vscode.LanguageModelChatRequestHandleOptio
 	let tool_choice: "auto" | { type: "function"; function: { name: string } } = "auto";
 	if (options.toolMode === vscode.LanguageModelChatToolMode.Required) {
 		if (tools.length !== 1) {
-            console.error("[Lemonade Model Provider] ToolMode.Required but multiple tools:", tools.length);
+            log(`[Lemonade Model Provider] ToolMode.Required but multiple tools: ${tools.length}`);
             throw new Error("LanguageModelChatToolMode.Required is not supported with more than one tool");
 		}
 		tool_choice = { type: "function", function: { name: sanitizeFunctionName(tools[0].name) } };
@@ -234,10 +238,10 @@ export function convertTools(options: vscode.LanguageModelChatRequestHandleOptio
  * Validate tool names to ensure they contain only word chars, hyphens, or underscores.
  * @param tools Tools to validate.
  */
-export function validateTools(tools: readonly vscode.LanguageModelChatTool[]): void {
+export function validateTools(tools: readonly vscode.LanguageModelChatTool[], log: LogFn = console.error): void {
 	for (const tool of tools) {
 		if (!tool.name.match(/^[\w-]+$/)) {
-            console.error("[Lemonade Model Provider] Invalid tool name detected:", tool.name);
+            log(`[Lemonade Model Provider] Invalid tool name detected: ${tool.name}`);
             throw new Error(
                 `Invalid tool name "${tool.name}": only alphanumeric characters, hyphens, and underscores are allowed.`
             );
@@ -249,10 +253,10 @@ export function validateTools(tools: readonly vscode.LanguageModelChatTool[]): v
  * Validate the request message sequence for correct tool call/result pairing.
  * @param messages The full request message list.
  */
-export function validateRequest(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
+export function validateRequest(messages: readonly vscode.LanguageModelChatRequestMessage[], log: LogFn = console.error): void {
 	const lastMessage = messages[messages.length - 1];
 	if (!lastMessage) {
-    console.error("[Lemonade Model Provider] No messages in request");
+    log("[Lemonade Model Provider] No messages in request");
     throw new Error("Invalid request: no messages.");
 	}
 
@@ -273,7 +277,7 @@ export function validateRequest(messages: readonly vscode.LanguageModelChatReque
 			while (toolCallIds.size > 0) {
 				const nextMessage = messages[nextMessageIdx++];
 				if (!nextMessage || nextMessage.role !== vscode.LanguageModelChatMessageRole.User) {
-                    console.error("[Lemonade Model Provider] Validation failed: missing tool result for call IDs:", Array.from(toolCallIds));
+                    log(`[Lemonade Model Provider] Validation failed: missing tool result for call IDs: ${Array.from(toolCallIds).join(", ")}`);
                     throw new Error(errMsg);
 				}
 
@@ -282,7 +286,7 @@ export function validateRequest(messages: readonly vscode.LanguageModelChatReque
 						const ctorName =
 							(Object.getPrototypeOf(part as object) as { constructor?: { name?: string } } | undefined)?.constructor
 								?.name ?? typeof part;
-                        console.error("[Lemonade Model Provider] Validation failed: expected tool result part, got:", ctorName);
+                        log(`[Lemonade Model Provider] Validation failed: expected tool result part, got: ${ctorName}`);
                         throw new Error(errMsg);
 					}
 					const callId = (part as { callId: string }).callId;
@@ -331,7 +335,8 @@ function mapRole(message: vscode.LanguageModelChatRequestMessage): Exclude<OpenA
  */
 function collectToolResultText(
 	pr: { content?: ReadonlyArray<unknown> },
-	filterEphemeral: boolean = true
+	filterEphemeral: boolean = true,
+	log: LogFn = console.error
 ): string {
 	let text = "";
 	for (const c of pr.content ?? []) {
@@ -358,9 +363,7 @@ function collectToolResultText(
 					? (Object.getPrototypeOf(c as object) as { constructor?: { name?: string } } | undefined)
 						?.constructor?.name
 					: undefined;
-				console.warn(
-					`[Lemonade Model Provider] failed to serialize tool-result part: ctor=${ctor ?? typeof c} mimeType=${String(mimeType)}`
-				);
+				log(`[Lemonade Model Provider] [WARN] failed to serialize tool-result part: ctor=${ctor ?? typeof c} mimeType=${String(mimeType)}`);
 			}
 		}
 	}

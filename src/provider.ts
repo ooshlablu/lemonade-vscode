@@ -72,7 +72,6 @@ function resolveRequestTimeout(): number {
  * VS Code Chat provider backed by Lemonade local LLM server.
  */
 export class LemonadeChatModelProvider implements LanguageModelChatProvider {
-	private _chatEndpoints: { model: string; modelMaxPromptTokens: number }[] = [];
 	/** Monotonically increasing counter to detect stale requests. Each call to
 	 *  `provideLanguageModelChatResponse` captures the current generation; any
 	 *  streaming response whose generation no longer matches the latest is
@@ -229,11 +228,6 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			);
 		}
 
-		this._chatEndpoints = infos.map((info) => ({
-			model: info.id,
-			modelMaxPromptTokens: info.maxInputTokens + info.maxOutputTokens,
-		}));
-
 		return infos;
 	}
 
@@ -373,11 +367,12 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			const filterEphemeralSetting = await this.secrets.get("lemonade.filterEphemeralData");
 			const filterEphemeral = filterEphemeralSetting !== "false";
 
-            const openaiMessages = convertMessages(messages, filterEphemeral);
+            const log = (msg: string) => this.outputChannel.appendLine(`[${this._ts()}] ${msg}`);
+            const openaiMessages = convertMessages(messages, filterEphemeral, log);
 
-			validateRequest(messages);
+			validateRequest(messages, log);
 
-            const toolConfig = convertTools(options);
+            const toolConfig = convertTools(options, log);
 
         if (options.tools && options.tools.length > 128) {
             throw new Error("Cannot have more than 128 tools per request.");
@@ -429,16 +424,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			const controller = new AbortController();
 			    const requestTimeout = resolveRequestTimeout();
 			    const timeoutId = setTimeout(() => {
-				    console.error("[Lemonade Model Provider] HTTP request timeout", {
-					    modelId: model.id,
-					    timeoutMs: requestTimeout,
-				    });
+				    this.outputChannel.appendLine(`[${this._ts()}] [WARN] HTTP request timeout (model=${model.id}, timeoutMs=${requestTimeout})`);
 				    controller.abort();
 			    }, requestTimeout);
 			    const cancellationSubscription = token.onCancellationRequested(() => {
-				    console.error("[Lemonade Model Provider] VS Code cancelled HTTP request", {
-					    modelId: model.id,
-				    });
+				    this.outputChannel.appendLine(`[${this._ts()}] [INFO] VS Code cancelled HTTP request (model=${model.id})`);
 				    controller.abort();
 			    });
 			try {
@@ -1028,7 +1018,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             const parsed = tryParseJSONObject(buf.args);
             if (!parsed.ok) {
                 if (throwOnInvalid) {
-                    console.error("[Lemonade Model Provider] Invalid JSON for tool call", { idx, snippet: (buf.args || "").slice(0, 200) });
+                    this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Invalid JSON for tool call (idx=${idx}): ${(buf.args || "").slice(0, 200)}`);
                     throw new Error("Invalid JSON for tool call");
                 }
                 // When not throwing (e.g. on [DONE]), drop silently to reduce noise
@@ -1046,15 +1036,4 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
         }
     }
 
-	/** Strip provider control tokens like <|tool_calls_section_begin|> and <|tool_call_begin|> from streamed text. */
-	private stripControlTokens(text: string): string {
-		try {
-			// Remove section markers and explicit tool call begin/argument/end markers that some backends stream as text
-			return text
-				.replace(/<\|[a-zA-Z0-9_-]+_section_(?:begin|end)\|>/g, "")
-				.replace(/<\|tool_call_(?:argument_)?(?:begin|end)\|>/g, "");
-		} catch {
-			return text;
-		}
-	}
 }
