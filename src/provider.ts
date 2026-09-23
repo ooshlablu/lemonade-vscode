@@ -12,6 +12,8 @@ import {
 import { convertTools, convertMessages, tryParseJSONObject, validateRequest } from "./utils";
 import type { LemonadeEndpoint, LemonadeModel, LemonadeModelsResponse } from "./types";
 import { resolveModelContextLengths } from "./modelContext";
+import type { Logger } from "./logger";
+import { createFallbackLogger } from "./logger";
 
 const DEFAULT_BASE_URL = "http://localhost:13305/api/v1";
 const DEFAULT_MAX_OUTPUT_TOKENS = 16000;
@@ -117,11 +119,32 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	/** Buffer for handling control tokens that might be split across streaming chunks. */
 	private _controlTokenBuffer = "";
 
+	/** VS Code output channel for Lemonade extension logging. */
+	private readonly outputChannel: Logger;
+
+	/** Format a timestamp as HH:MM:SS.mmm */
+	private _ts(): string {
+		const now = new Date();
+		const h = String(now.getHours()).padStart(2, '0');
+		const m = String(now.getMinutes()).padStart(2, '0');
+		const s = String(now.getSeconds()).padStart(2, '0');
+		const ms = String(now.getMilliseconds()).padStart(3, '0');
+		return `${h}:${m}:${s}.${ms}`;
+	}
+
 	/**
 	 * Create a provider using the given secret storage for the server URL.
 	 * @param secrets VS Code secret storage.
+	 * @param userAgent User-Agent header value.
+	 * @param outputChannel Optional VS Code output channel for logging. Falls back to console.error.
 	 */
-	constructor(private readonly secrets: vscode.SecretStorage, private readonly userAgent: string) {}
+	constructor(
+		private readonly secrets: vscode.SecretStorage,
+		private readonly userAgent: string,
+		outputChannel?: Logger,
+	) {
+		this.outputChannel = outputChannel ?? createFallbackLogger();
+	}
 
 	/** Roughly estimate tokens for VS Code chat messages (text only) */
 	private estimateMessagesTokens(msgs: readonly vscode.LanguageModelChatMessage[]): number {
@@ -344,10 +367,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 				try {
 					progress.report(part);
 				} catch (e) {
-					console.error("[Lemonade Model Provider] Progress.report failed", {
-						modelId: model.id,
-						error: e instanceof Error ? { name: e.name, message: e.message } : String(e),
-					});
+					this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Progress.report failed: ${e instanceof Error ? e.message : String(e)}`);
 				}
 			},
 		};
@@ -371,11 +391,12 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			const filterEphemeralSetting = await this.secrets.get("lemonade.filterEphemeralData");
 			const filterEphemeral = filterEphemeralSetting !== "false";
 
-            const openaiMessages = convertMessages(messages, filterEphemeral);
+            const log = (msg: string) => this.outputChannel.appendLine(`[${this._ts()}] ${msg}`);
+            const openaiMessages = convertMessages(messages, filterEphemeral, log);
 
-			validateRequest(messages);
+			validateRequest(messages, log);
 
-            const toolConfig = convertTools(options);
+            const toolConfig = convertTools(options, log);
 
         if (options.tools && options.tools.length > 128) {
             throw new Error("Cannot have more than 128 tools per request.");
@@ -385,7 +406,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
             const tokenLimit = Math.max(1, model.maxInputTokens);
             if (inputTokenCount + toolTokenCount > tokenLimit) {
-                console.error("[Lemonade Provider] Message exceeds token limit", { total: inputTokenCount + toolTokenCount, tokenLimit });
+                this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Message exceeds token limit: ${inputTokenCount + toolTokenCount}/${tokenLimit}`);
                 throw new Error("Message exceeds token limit.");
             }
 
@@ -396,6 +417,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                 max_tokens: Math.min(options.modelOptions?.max_tokens || 4096, model.maxOutputTokens),
                 temperature: options.modelOptions?.temperature ?? 0.7,
             };
+
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request: model=${realModelId}, messages=${openaiMessages.length}, max_tokens=${(requestBody as Record<string, unknown>).max_tokens}, temperature=${(requestBody as Record<string, unknown>).temperature}`);
 
 			// Allow-list model options
 			if (options.modelOptions) {
@@ -437,9 +460,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                 body: JSON.stringify(requestBody),
             });
 
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Response: status=${response.status} ${response.statusText}`);
+
 			if (!response.ok) {
 				const errorText = await response.text();
-				console.error("[Lemonade Model Provider] API error response", errorText);
+				this.outputChannel.appendLine(`[${this._ts()}] [ERROR] API error response: ${errorText}`);
 				throw new Error(
 					`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
 				);
@@ -448,13 +473,10 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			if (!response.body) {
 				throw new Error("No response body from Lemonade API");
 			}
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
 			await this.processStreamingResponse(response.body, trackingProgress, token);
 		} catch (err) {
-			console.error("[Lemonade Model Provider] Chat request failed", {
-				modelId: model.id,
-				messageCount: messages.length,
-				error: err instanceof Error ? { name: err.name, message: err.message } : String(err),
-			});
+			this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Chat request failed: model=${model.id}, messages=${messages.length}, error=${err instanceof Error ? err.message : String(err)}`);
 			throw err;
 		}
 	}
@@ -950,7 +972,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             const parsed = tryParseJSONObject(buf.args);
             if (!parsed.ok) {
                 if (throwOnInvalid) {
-                    console.error("[Lemonade Model Provider] Invalid JSON for tool call", { idx, snippet: (buf.args || "").slice(0, 200) });
+                    this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Invalid JSON for tool call (idx=${idx}): ${(buf.args || "").slice(0, 200)}`);
                     throw new Error("Invalid JSON for tool call");
                 }
                 // When not throwing (e.g. on [DONE]), drop silently to reduce noise
