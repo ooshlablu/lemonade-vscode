@@ -1,0 +1,12 @@
+# Keep the docker build context small. The repo is bind-mounted at run time,
+# so build artifacts and dependencies never need to be part of the context.
+node_modules/
+.vscode-test/
+out/
+dist/
+target/
+build/
+*.vsix
+vscode.d.ts
+.git/
+.DS_Store
