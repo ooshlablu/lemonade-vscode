@@ -74,8 +74,13 @@ function resolveRequestTimeout(): number {
 export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	/** Guard against concurrent requests — only one request at a time. */
 	private _inFlight = false;
-	/** Queue of requests that arrived while another was in-flight. */
+	/** Queue of promises for queued requests. Each promise resolves when the
+	 *  queued request completes.  When the current request finishes, the next
+	 *  item in the queue is awaited before the previous caller's promise
+	 *  resolves. */
 	private _requestQueue: Array<{
+		resolve: () => void;
+		reject: (err: Error) => void;
 		model: LanguageModelChatInformation;
 		messages: readonly LanguageModelChatMessage[];
 		options: LanguageModelChatRequestHandleOptions;
@@ -332,195 +337,219 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 		progress: Progress<LanguageModelResponsePart>,
 		token: CancellationToken
 	): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			// Guard against concurrent requests — VS Code may call this method
+			// multiple times in quick succession (e.g. user rapidly sends messages
+			// or switches models).  Only one request runs at a time; additional
+			// requests are queued and processed sequentially after the current one
+			// completes or is cancelled.
+			if (this._inFlight) {
+				this.outputChannel.appendLine(`[${this._ts()}] [WARN] Request queued (another request already in-flight)`);
+				this._requestQueue.push({ resolve, reject, model, messages, options, progress, token });
+				return;
+			}
+			this._inFlight = true;
 
-		// Guard against concurrent requests — VS Code may call this method
-		// multiple times in quick succession (e.g. user rapidly sends messages
-		// or switches models).  Only one request runs at a time; additional
-		// requests are queued and processed sequentially after the current one
-		// completes or is cancelled.
-		if (this._inFlight) {
-			this.outputChannel.appendLine(`[${this._ts()}] [WARN] Request queued (another request already in-flight)`);
-			this._requestQueue.push({ model, messages, options, progress, token });
-			return;
-		}
-		this._inFlight = true;
-
-		try {
-			this._toolCallBuffers.clear();
-			this._completedToolCallIndices.clear();
-			this._staleChunkCount = 0;
-			this._hasEmittedAssistantText = false;
-			this._emittedBeginToolCallsHint = false;
-		    this._textToolParserBuffer = "";
-		    this._textToolActive = undefined;
-		    this._emittedTextToolCallKeys.clear();
-		    this._emittedTextToolCallIds.clear();
-		    this._controlTokenBuffer = "";
-
-			// Capture the current generation — if the user switches models VS Code
-			// will start a new request with a new generation; responses from the
-			// old request are discarded via processStreamingResponse.
-			const currentGeneration = ++this._requestGeneration;
-			let finalUsage: Record<string, unknown> = {};
-
-			let requestBody: Record<string, unknown> | undefined;
-			const trackingProgress: Progress<LanguageModelResponsePart> = {
-				report: (part) => {
-					try {
-						progress.report(part);
-					} catch (e) {
-						this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Progress.report failed: ${e instanceof Error ? e.message : String(e)}`);
-					}
-				},
+			// Helper to process the next queued request after the current one completes
+			const processNext = () => {
+				if (this._requestQueue.length > 0) {
+					const next = this._requestQueue.shift()!;
+					this.outputChannel.appendLine(`[${this._ts()}] [INFO] Processing queued request`);
+					this.processSingleRequest(next.model, next.messages, next.options, next.progress, next.token)
+						.then(next.resolve)
+						.catch(next.reject)
+						.finally(() => {
+							// Process next queued request if any
+							if (this._requestQueue.length > 0) {
+								processNext();
+							}
+						});
+				}
 			};
 
-			// ---- original body (indented one level) ----
-			try {
-				// Decode "<shortname>/<modelId>" from the model id
-				const slashIdx = model.id.indexOf("/");
-				const shortname = slashIdx >= 0 ? model.id.slice(0, slashIdx) : "default";
-				const realModelId = slashIdx >= 0 ? model.id.slice(slashIdx + 1) : model.id;
-
-				const endpoints = await this.getEndpoints();
-				const endpoint = endpoints.find(ep => ep.shortname === shortname)
-					?? endpoints[0]
-					?? { shortname: "default", url: DEFAULT_BASE_URL };
-
-				const baseUrl = endpoint.url;
-				const apiKey = endpoint.apiKey || DEFAULT_API_KEY;
-
-				// Check if ephemeral data filtering is enabled (default: true)
-				const filterEphemeralSetting = await this.secrets.get("lemonade.filterEphemeralData");
-				const filterEphemeral = filterEphemeralSetting !== "false";
-
-			    const log = (msg: string) => this.outputChannel.appendLine(`[${this._ts()}] ${msg}`);
-			    const openaiMessages = convertMessages(messages, filterEphemeral, log);
-
-				validateRequest(messages, log);
-
-			    const toolConfig = convertTools(options, log);
-
-		        if (options.tools && options.tools.length > 128) {
-					throw new Error("Cannot have more than 128 tools per request.");
-			        }
-
-				    const inputTokenCount = this.estimateMessagesTokens(messages);
-				    const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
-				    const tokenLimit = Math.max(1, model.maxInputTokens);
-				    if (inputTokenCount + toolTokenCount > tokenLimit) {
-						this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Message exceeds token limit: ${inputTokenCount + toolTokenCount}/${tokenLimit}`);
-						throw new Error("Message exceeds token limit.");
-				    }
-
-				    const maxOutputTokens = await resolveMaxOutputTokens();
-				    requestBody = {
-						model: realModelId,
-						messages: openaiMessages,
-						stream: true,
-						// Ask the server to include token usage in the final streamed
-						// chunk. Without this, OpenAI-compatible endpoints omit `usage`
-						// from the stream, so VS Code has no token stats to display.
-						stream_options: { include_usage: true },
-						max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
-						temperature: options.modelOptions?.temperature ?? 0.7,
-					};
-
-				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request: model=${realModelId}, messages=${openaiMessages.length}, max_tokens=${(requestBody as Record<string, unknown>).max_tokens}, temperature=${(requestBody as Record<string, unknown>).temperature}`);
-
-				// Allow-list model options
-				if (options.modelOptions) {
-					const mo = options.modelOptions as Record<string, unknown>;
-					if (typeof mo.stop === "string" || Array.isArray(mo.stop)) {
-						(requestBody as Record<string, unknown>).stop = mo.stop;
-					}
-					if (typeof mo.frequency_penalty === "number") {
-						(requestBody as Record<string, unknown>).frequency_penalty = mo.frequency_penalty;
-					}
-					if (typeof mo.presence_penalty === "number") {
-						(requestBody as Record<string, unknown>).presence_penalty = mo.presence_penalty;
-					}
-				}
-
-				if (toolConfig.tools) {
-					(requestBody as Record<string, unknown>).tools = toolConfig.tools;
-				}
-				if (toolConfig.tool_choice) {
-					(requestBody as Record<string, unknown>).tool_choice = toolConfig.tool_choice;
-				}
-				const controller = new AbortController();
-					const requestTimeout = resolveRequestTimeout();
-					const timeoutId = setTimeout(() => {
-						this.outputChannel.appendLine(`[${this._ts()}] [WARN] HTTP request timeout (model=${model.id}, timeoutMs=${requestTimeout})`);
-						controller.abort();
-					}, requestTimeout);
-					const cancellationSubscription = token.onCancellationRequested(() => {
-						this.outputChannel.appendLine(`[${this._ts()}] [INFO] VS Code cancelled HTTP request (model=${model.id})`);
-						controller.abort();
-					});
-				try {
-					const response = await fetch(`${baseUrl}/chat/completions`, {
-							method: "POST",
-						headers: {
-								Authorization: `Bearer ${apiKey}`,
-								"Content-Type": "application/json",
-								"User-Agent": this.userAgent,
-							},
-						body: JSON.stringify(requestBody),
-						signal: controller.signal,
-					});
-
-					this.outputChannel.appendLine(`[${this._ts()}] [INFO] Response: status=${response.status} ${response.statusText}`);
-
-					if (!response.ok) {
-						const errorText = await response.text();
-						this.outputChannel.appendLine(`[${this._ts()}] [ERROR] API error response: ${errorText}`);
-						throw new Error(
-							`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
-						);
-					}
-
-					if (!response.body) {
-						throw new Error("No response body from Lemonade API");
-					}
-					this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
-					await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration, finalUsage);
-					// Only report usage when the server actually returned token
-					// counts. VS Code reads `prompt_tokens`/`completion_tokens`
-					// (snake_case) from this part to render token stats.
-					if (this.hasUsage(finalUsage)) {
-						trackingProgress.report(new vscode.LanguageModelDataPart(
-							new TextEncoder().encode(JSON.stringify(finalUsage)),
-							'usage'
-						));
-						this.outputChannel.appendLine(`[${this._ts()}] [INFO] Reported usage: ${JSON.stringify(finalUsage)}`);
-					} else {
-						this.outputChannel.appendLine(`[${this._ts()}] [WARN] No usage data in streaming response; token stats will not be shown`);
-					}
-				} finally {
-					cancellationSubscription.dispose();
-					clearTimeout(timeoutId);
-				}
-			} catch (err) {
-				const errMsg = err instanceof Error ? err.message : String(err);
-				// Abort errors are expected when VS Code cancels the request (user types a new message,
-				// switches models, etc.). Swallow them silently — they're not real failures.
-				if (errMsg.includes("aborted") || errMsg.includes("abort") || errMsg.includes("cancel")) {
-					this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request aborted (VS Code LM API cancelled)`);
-					return;
-				}
-				this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Chat request failed: model=${model.id}, messages=${messages.length}, error=${errMsg}`);
-				throw err;
-			}
-		} finally {
-			// Mark in-flight as complete and process next queued request
-			this._inFlight = false;
-			if (this._requestQueue.length > 0) {
-				const next = this._requestQueue.shift()!;
-				// Recursively process the next request
-				this.provideLanguageModelChatResponse(next.model, next.messages, next.options, next.progress, next.token).catch(() => {
-					// Errors are handled inside the recursive call
+			// Process this request, then process next in queue
+			this.processSingleRequest(model, messages, options, progress, token)
+				.then(resolve)
+				.catch(reject)
+				.finally(() => {
+					this._inFlight = false;
+					processNext();
 				});
+		});
+	}
+
+	/**
+	 * Process a single chat request from start to finish.
+	 * Called either directly (first request) or from the queue (subsequent requests).
+	 */
+	private async processSingleRequest(
+		model: LanguageModelChatInformation,
+		messages: readonly LanguageModelChatMessage[],
+		options: LanguageModelChatRequestHandleOptions,
+		progress: Progress<LanguageModelResponsePart>,
+		token: CancellationToken
+	): Promise<void> {
+		this._toolCallBuffers.clear();
+		this._completedToolCallIndices.clear();
+		this._staleChunkCount = 0;
+		this._hasEmittedAssistantText = false;
+		this._emittedBeginToolCallsHint = false;
+	    this._textToolParserBuffer = "";
+	    this._textToolActive = undefined;
+	    this._emittedTextToolCallKeys.clear();
+	    this._emittedTextToolCallIds.clear();
+	    this._controlTokenBuffer = "";
+
+		// Capture the current generation — if the user switches models VS Code
+		// will start a new request with a new generation; responses from the
+		// old request are discarded via processStreamingResponse.
+		const currentGeneration = ++this._requestGeneration;
+		let finalUsage: Record<string, unknown> = {};
+
+		let requestBody: Record<string, unknown> | undefined;
+		const trackingProgress: Progress<LanguageModelResponsePart> = {
+			report: (part) => {
+				try {
+					progress.report(part);
+				} catch (e) {
+					this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Progress.report failed: ${e instanceof Error ? e.message : String(e)}`);
+				}
+			},
+		};
+
+		// Decode "<shortname>/<modelId>" from the model id
+		const slashIdx = model.id.indexOf("/");
+		const shortname = slashIdx >= 0 ? model.id.slice(0, slashIdx) : "default";
+		const realModelId = slashIdx >= 0 ? model.id.slice(slashIdx + 1) : model.id;
+
+		const endpoints = await this.getEndpoints();
+		const endpoint = endpoints.find(ep => ep.shortname === shortname)
+			?? endpoints[0]
+			?? { shortname: "default", url: DEFAULT_BASE_URL };
+
+		const baseUrl = endpoint.url;
+		const apiKey = endpoint.apiKey || DEFAULT_API_KEY;
+
+		// Check if ephemeral data filtering is enabled (default: true)
+		const filterEphemeralSetting = await this.secrets.get("lemonade.filterEphemeralData");
+		const filterEphemeral = filterEphemeralSetting !== "false";
+
+	    const log = (msg: string) => this.outputChannel.appendLine(`[${this._ts()}] ${msg}`);
+	    const openaiMessages = convertMessages(messages, filterEphemeral, log);
+
+		validateRequest(messages, log);
+
+	    const toolConfig = convertTools(options, log);
+
+        if (options.tools && options.tools.length > 128) {
+			throw new Error("Cannot have more than 128 tools per request.");
+	        }
+
+		    const inputTokenCount = this.estimateMessagesTokens(messages);
+		    const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
+		    const tokenLimit = Math.max(1, model.maxInputTokens);
+		    if (inputTokenCount + toolTokenCount > tokenLimit) {
+				this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Message exceeds token limit: ${inputTokenCount + toolTokenCount}/${tokenLimit}`);
+				throw new Error("Message exceeds token limit.");
+		    }
+
+		    const maxOutputTokens = await resolveMaxOutputTokens();
+		    requestBody = {
+				model: realModelId,
+				messages: openaiMessages,
+				stream: true,
+				// Ask the server to include token usage in the final streamed
+				// chunk. Without this, OpenAI-compatible endpoints omit `usage`
+				// from the stream, so VS Code has no token stats to display.
+				stream_options: { include_usage: true },
+				max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
+				temperature: options.modelOptions?.temperature ?? 0.7,
+			};
+
+		this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request: model=${realModelId}, messages=${openaiMessages.length}, max_tokens=${(requestBody as Record<string, unknown>).max_tokens}, temperature=${(requestBody as Record<string, unknown>).temperature}`);
+
+		// Allow-list model options
+		if (options.modelOptions) {
+			const mo = options.modelOptions as Record<string, unknown>;
+			if (typeof mo.stop === "string" || Array.isArray(mo.stop)) {
+				(requestBody as Record<string, unknown>).stop = mo.stop;
 			}
+			if (typeof mo.frequency_penalty === "number") {
+				(requestBody as Record<string, unknown>).frequency_penalty = mo.frequency_penalty;
+			}
+			if (typeof mo.presence_penalty === "number") {
+				(requestBody as Record<string, unknown>).presence_penalty = mo.presence_penalty;
+			}
+		}
+
+		if (toolConfig.tools) {
+			(requestBody as Record<string, unknown>).tools = toolConfig.tools;
+		}
+		if (toolConfig.tool_choice) {
+			(requestBody as Record<string, unknown>).tool_choice = toolConfig.tool_choice;
+		}
+		const controller = new AbortController();
+			const requestTimeout = resolveRequestTimeout();
+			const timeoutId = setTimeout(() => {
+				this.outputChannel.appendLine(`[${this._ts()}] [WARN] HTTP request timeout (model=${model.id}, timeoutMs=${requestTimeout})`);
+				controller.abort();
+			}, requestTimeout);
+			const cancellationSubscription = token.onCancellationRequested(() => {
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] VS Code cancelled HTTP request (model=${model.id})`);
+				controller.abort();
+			});
+		try {
+			const response = await fetch(`${baseUrl}/chat/completions`, {
+					method: "POST",
+				headers: {
+						Authorization: `Bearer ${apiKey}`,
+						"Content-Type": "application/json",
+						"User-Agent": this.userAgent,
+					},
+				body: JSON.stringify(requestBody),
+				signal: controller.signal,
+			});
+
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Response: status=${response.status} ${response.statusText}`);
+
+			if (!response.ok) {
+				const errorText = await response.text();
+				this.outputChannel.appendLine(`[${this._ts()}] [ERROR] API error response: ${errorText}`);
+				throw new Error(
+					`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
+				);
+			}
+
+			if (!response.body) {
+				throw new Error("No response body from Lemonade API");
+			}
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
+			await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration, finalUsage);
+			// Only report usage when the server actually returned token
+			// counts. VS Code reads `prompt_tokens`/`completion_tokens`
+			// (snake_case) from this part to render token stats.
+			if (this.hasUsage(finalUsage)) {
+				trackingProgress.report(new vscode.LanguageModelDataPart(
+					new TextEncoder().encode(JSON.stringify(finalUsage)),
+					'usage'
+				));
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Reported usage: ${JSON.stringify(finalUsage)}`);
+			} else {
+				this.outputChannel.appendLine(`[${this._ts()}] [WARN] No usage data in streaming response; token stats will not be shown`);
+			}
+		} catch (err) {
+			const errMsg = err instanceof Error ? err.message : String(err);
+			// Abort errors are expected when VS Code cancels the request (user types a new message,
+			// switches models, etc.). Swallow them silently — they're not real failures.
+			if (errMsg.includes("aborted") || errMsg.includes("abort") || errMsg.includes("cancel")) {
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request aborted (VS Code LM API cancelled)`);
+				return;
+			}
+			this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Chat request failed: model=${model.id}, messages=${messages.length}, error=${errMsg}`);
+			throw err;
+		} finally {
+			cancellationSubscription.dispose();
+			clearTimeout(timeoutId);
 		}
 	}
 	async provideTokenCount(
