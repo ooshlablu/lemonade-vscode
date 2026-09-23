@@ -559,6 +559,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
         const reader = responseBody.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        let doneReceived = false;
 
 		try {
 			while (!token.isCancellationRequested) {
@@ -585,7 +586,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                         await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
                         // Flush any in-progress text-embedded tool call (silent if incomplete)
                         await this.flushActiveTextToolCall(progress);
-                        continue;
+                        doneReceived = true;
+                        return; // Stream complete — exit early to avoid extra read
                     }
 
 					try {
@@ -623,8 +625,10 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             reader.releaseLock();
             if (token.isCancellationRequested) {
                 this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stream cancelled (VS Code LM API internal cancellation)`);
+            } else if (doneReceived) {
+                this.outputChannel.appendLine(`[${this._ts()}] [INFO] Stream reader closed normally after [DONE]`);
             } else {
-                this.outputChannel.appendLine(`[${this._ts()}] [INFO] Stream reader closed (no [DONE] received)`);
+                this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stream reader closed without receiving [DONE] — response may be incomplete`);
             }
             // Clean up any leftover tool call state
             this._toolCallBuffers.clear();
