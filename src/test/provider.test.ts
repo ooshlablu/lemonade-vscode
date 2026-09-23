@@ -222,6 +222,146 @@ suite("Lemonade Chat Provider Extension", () => {
 		});
 	});
 
+	suite("stats and usage report", () => {
+		interface CapturedPart {
+			kind: string;
+			value?: string;
+			mimeType?: string;
+		}
+
+		function captureParts(): { parts: CapturedPart[]; report: (p: unknown) => void } {
+			const parts: CapturedPart[] = [];
+			const report = (p: unknown) => {
+				const part = p as { constructor?: { name?: string }; data?: unknown; mimeType?: unknown };
+				if (part instanceof vscode.LanguageModelDataPart) {
+					parts.push({
+						kind: "data",
+						value: new TextDecoder().decode(part.data as Uint8Array),
+						mimeType: part.mimeType,
+					});
+				} else {
+					parts.push({ kind: part.constructor?.name ?? typeof part });
+				}
+			};
+			return { parts, report };
+		}
+
+		/** Run one full request against a controllable stream, feeding the given SSE payload. */
+		async function runRequest(
+			provider: LemonadeChatModelProvider,
+			streams: ReturnType<typeof controllableStream>[],
+			report: (p: unknown) => void,
+			ssePayloads: string[]
+		): Promise<void> {
+			const p = provider.provideLanguageModelChatResponse(
+				makeTestModel(),
+				[makeUserMessage("usage")],
+				{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+				{ report },
+				new vscode.CancellationTokenSource().token
+			);
+			for (let i = 0; i < 100 && streams.length < 1; i++) {
+				await sleep(5);
+			}
+			for (const s of ssePayloads) {
+				streams[0].send(s);
+			}
+			streams[0].close();
+			await p;
+		}
+
+		test("sends stream_options include_usage and reports a usage data part", async () => {
+			const logger = new CaptureLogger();
+			const provider = new LemonadeChatModelProvider(makeSecretStorage(), "test/test", logger);
+			const streams: ReturnType<typeof controllableStream>[] = [];
+			const bodies: string[] = [];
+			const originalFetch = global.fetch;
+			try {
+				(global as unknown as Record<string, unknown>).fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+					const url = String(input);
+					if (url.endsWith("/models")) {
+						return { ok: true, json: async () => ({ object: "list", data: [] }) };
+					}
+					bodies.push(String(init?.body));
+					const s = controllableStream();
+					streams.push(s);
+					return { ok: true, status: 200, statusText: "OK", body: s.body, text: async () => "" };
+				};
+
+				const { parts, report } = captureParts();
+				await runRequest(
+					provider,
+					streams,
+					report,
+					[
+						'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+						'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\n',
+						'data: [DONE]\n\n',
+					]
+				);
+
+				// The request body must ask for usage in the stream.
+				assert.equal(bodies.length, 1, "one chat request expected");
+				const sent = JSON.parse(bodies[0]) as Record<string, unknown>;
+				assert.deepEqual(sent.stream_options, { include_usage: true }, "must send stream_options.include_usage");
+
+				// A usage data part must be reported with the token counts.
+				const usagePart = parts.find((p) => p.kind === "data" && p.mimeType === "usage");
+				assert.ok(usagePart, `expected a usage data part:\n${JSON.stringify(parts)}`);
+				assert.deepEqual(JSON.parse(usagePart!.value!), {
+					prompt_tokens: 10,
+					completion_tokens: 5,
+					total_tokens: 15,
+				});
+				assert.ok(
+					logger.lines.some((l) => l.includes("[INFO] Reported usage:")),
+					`missing usage log:\n${logger.lines.join("\n")}`
+				);
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+
+		test("does not report a usage part when the server returns no token counts", async () => {
+			const logger = new CaptureLogger();
+			const provider = new LemonadeChatModelProvider(makeSecretStorage(), "test/test", logger);
+			const streams: ReturnType<typeof controllableStream>[] = [];
+			const originalFetch = global.fetch;
+			try {
+				(global as unknown as Record<string, unknown>).fetch = async (input: RequestInfo | URL) => {
+					const url = String(input);
+					if (url.endsWith("/models")) {
+						return { ok: true, json: async () => ({ object: "list", data: [] }) };
+					}
+					const s = controllableStream();
+					streams.push(s);
+					return { ok: true, status: 200, statusText: "OK", body: s.body, text: async () => "" };
+				};
+
+				const { parts, report } = captureParts();
+				await runRequest(
+					provider,
+					streams,
+					report,
+					[
+						'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
+						'data: {"choices":[],"usage":{}}\n\n',
+						'data: [DONE]\n\n',
+					]
+				);
+
+				const usagePart = parts.find((p) => p.kind === "data" && p.mimeType === "usage");
+				assert.ok(!usagePart, `no usage part expected when counts are empty:\n${JSON.stringify(parts)}`);
+				assert.ok(
+					logger.lines.some((l) => l.includes("[WARN] No usage data in streaming response")),
+					`missing no-usage warning:\n${logger.lines.join("\n")}`
+				);
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+	});
+
 	suite("provider", () => {
 		test("prepareLanguageModelChatInformation returns array", async () => {
 			const provider = new LemonadeChatModelProvider({

@@ -164,6 +164,20 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	}
 
 	/**
+	 * Determine whether a streamed usage payload contains real token counts.
+	 * OpenAI-compatible servers report `prompt_tokens` and `completion_tokens`
+	 * (snake_case). VS Code reads these exact fields to render token stats, so
+	 * we only emit a usage part when at least one of them is present and > 0.
+	 */
+	private hasUsage(usage: Record<string, unknown>): boolean {
+		const prompt = usage["prompt_tokens"];
+		const completion = usage["completion_tokens"];
+		const hasPrompt = typeof prompt === "number" && prompt > 0;
+		const hasCompletion = typeof completion === "number" && completion > 0;
+		return hasPrompt || hasCompletion;
+	}
+
+	/**
 	 * Get the list of available language models contributed by this provider.
 	 * Fans out to all configured endpoints concurrently; failures on individual
 	 * endpoints are swallowed so healthy nodes still appear.
@@ -323,6 +337,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 		// will start a new request with a new generation; responses from the
 		// old request are discarded via processStreamingResponse.
 		const currentGeneration = ++this._requestGeneration;
+		let finalUsage: Record<string, unknown> = {};
 
 		let requestBody: Record<string, unknown> | undefined;
 		const trackingProgress: Progress<LanguageModelResponsePart> = {
@@ -376,6 +391,10 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                 model: realModelId,
                 messages: openaiMessages,
                 stream: true,
+                // Ask the server to include token usage in the final streamed
+                // chunk. Without this, OpenAI-compatible endpoints omit `usage`
+                // from the stream, so VS Code has no token stats to display.
+                stream_options: { include_usage: true },
                 max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
                 temperature: options.modelOptions?.temperature ?? 0.7,
             };
@@ -438,7 +457,19 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 					throw new Error("No response body from Lemonade API");
 				}
 				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
-				await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration);
+				await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration, finalUsage);
+				// Only report usage when the server actually returned token
+				// counts. VS Code reads `prompt_tokens`/`completion_tokens`
+				// (snake_case) from this part to render token stats.
+				if (this.hasUsage(finalUsage)) {
+					trackingProgress.report(new vscode.LanguageModelDataPart(
+						new TextEncoder().encode(JSON.stringify(finalUsage)),
+						'usage'
+					));
+					this.outputChannel.appendLine(`[${this._ts()}] [INFO] Reported usage: ${JSON.stringify(finalUsage)}`);
+				} else {
+					this.outputChannel.appendLine(`[${this._ts()}] [WARN] No usage data in streaming response; token stats will not be shown`);
+				}
 			} finally {
 				cancellationSubscription.dispose();
 				clearTimeout(timeoutId);
@@ -494,6 +525,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
         generation: number,
+        usageAccumulator?: Record<string, unknown>,
     ): Promise<void> {
         const reader = responseBody.getReader();
         const decoder = new TextDecoder();
@@ -542,6 +574,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 								this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stale SSE chunk discard count exceeded ${this._maxStaleWarnings}; suppressing further warnings`);
 							}
 							continue;
+						}
+						// Extract usage data from the response chunk (typically in the last chunk before [DONE])
+						const usage = (parsed as Record<string, unknown>).usage as Record<string, unknown> | undefined;
+						if (usage && usageAccumulator) {
+							Object.assign(usageAccumulator, usage);
 						}
                         await this.processDelta(parsed, progress);
 					} catch (error) {
