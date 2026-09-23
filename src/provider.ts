@@ -72,10 +72,26 @@ function resolveRequestTimeout(): number {
  * VS Code Chat provider backed by Lemonade local LLM server.
  */
 export class LemonadeChatModelProvider implements LanguageModelChatProvider {
+	/** Guard against concurrent requests — only one request at a time. */
+	private _inFlight = false;
+	/** Queue of promises for queued requests. Each promise resolves when the
+	 *  queued request completes.  When the current request finishes, the next
+	 *  item in the queue is awaited before the previous caller's promise
+	 *  resolves. */
+	private _requestQueue: Array<{
+		resolve: () => void;
+		reject: (err: Error) => void;
+		model: LanguageModelChatInformation;
+		messages: readonly LanguageModelChatMessage[];
+		options: LanguageModelChatRequestHandleOptions;
+		progress: Progress<LanguageModelResponsePart>;
+		token: CancellationToken;
+	}> = [];
+
 	/** Monotonically increasing counter to detect stale requests. Each call to
 	 *  `provideLanguageModelChatResponse` captures the current generation; any
 	 *  streaming response whose generation no longer matches the latest is
-	 *  discarded. */
+		 *  discarded. */
 	private _requestGeneration = 0;
 	/** Counter for stale SSE chunks discarded in the current streaming session. Used to cap logging spam. */
 	private _staleChunkCount = 0;
@@ -321,17 +337,68 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 		progress: Progress<LanguageModelResponsePart>,
 		token: CancellationToken
 	): Promise<void> {
+		return new Promise<void>((resolve, reject) => {
+			// Guard against concurrent requests — VS Code may call this method
+			// multiple times in quick succession (e.g. user rapidly sends messages
+			// or switches models).  Only one request runs at a time; additional
+			// requests are queued and processed sequentially after the current one
+			// completes or is cancelled.
+			if (this._inFlight) {
+				this.outputChannel.appendLine(`[${this._ts()}] [WARN] Request queued (another request already in-flight)`);
+				this._requestQueue.push({ resolve, reject, model, messages, options, progress, token });
+				return;
+			}
+			this._inFlight = true;
 
+			// Helper to process the next queued request after the current one completes
+			const processNext = () => {
+				if (this._requestQueue.length > 0) {
+					const next = this._requestQueue.shift()!;
+					this.outputChannel.appendLine(`[${this._ts()}] [INFO] Processing queued request`);
+					this.processSingleRequest(next.model, next.messages, next.options, next.progress, next.token)
+						.then(next.resolve)
+						.catch(next.reject)
+						.finally(() => {
+							// Process next queued request if any
+							if (this._requestQueue.length > 0) {
+								processNext();
+							}
+						});
+				}
+			};
+
+			// Process this request, then process next in queue
+			this.processSingleRequest(model, messages, options, progress, token)
+				.then(resolve)
+				.catch(reject)
+				.finally(() => {
+					this._inFlight = false;
+					processNext();
+				});
+		});
+	}
+
+	/**
+	 * Process a single chat request from start to finish.
+	 * Called either directly (first request) or from the queue (subsequent requests).
+	 */
+	private async processSingleRequest(
+		model: LanguageModelChatInformation,
+		messages: readonly LanguageModelChatMessage[],
+		options: LanguageModelChatRequestHandleOptions,
+		progress: Progress<LanguageModelResponsePart>,
+		token: CancellationToken
+	): Promise<void> {
 		this._toolCallBuffers.clear();
 		this._completedToolCallIndices.clear();
 		this._staleChunkCount = 0;
 		this._hasEmittedAssistantText = false;
 		this._emittedBeginToolCallsHint = false;
-        this._textToolParserBuffer = "";
-        this._textToolActive = undefined;
-        this._emittedTextToolCallKeys.clear();
-        this._emittedTextToolCallIds.clear();
-		this._controlTokenBuffer = "";
+	    this._textToolParserBuffer = "";
+	    this._textToolActive = undefined;
+	    this._emittedTextToolCallKeys.clear();
+	    this._emittedTextToolCallIds.clear();
+	    this._controlTokenBuffer = "";
 
 		// Capture the current generation — if the user switches models VS Code
 		// will start a new request with a new generation; responses from the
@@ -349,130 +416,126 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 				}
 			},
 		};
-		try {
-			// Decode "<shortname>/<modelId>" from the model id
-			const slashIdx = model.id.indexOf("/");
-			const shortname = slashIdx >= 0 ? model.id.slice(0, slashIdx) : "default";
-			const realModelId = slashIdx >= 0 ? model.id.slice(slashIdx + 1) : model.id;
 
-			const endpoints = await this.getEndpoints();
-			const endpoint = endpoints.find(ep => ep.shortname === shortname)
-				?? endpoints[0]
-				?? { shortname: "default", url: DEFAULT_BASE_URL };
+		// Decode "<shortname>/<modelId>" from the model id
+		const slashIdx = model.id.indexOf("/");
+		const shortname = slashIdx >= 0 ? model.id.slice(0, slashIdx) : "default";
+		const realModelId = slashIdx >= 0 ? model.id.slice(slashIdx + 1) : model.id;
 
-			const baseUrl = endpoint.url;
-			const apiKey = endpoint.apiKey || DEFAULT_API_KEY;
+		const endpoints = await this.getEndpoints();
+		const endpoint = endpoints.find(ep => ep.shortname === shortname)
+			?? endpoints[0]
+			?? { shortname: "default", url: DEFAULT_BASE_URL };
 
-			// Check if ephemeral data filtering is enabled (default: true)
-			const filterEphemeralSetting = await this.secrets.get("lemonade.filterEphemeralData");
-			const filterEphemeral = filterEphemeralSetting !== "false";
+		const baseUrl = endpoint.url;
+		const apiKey = endpoint.apiKey || DEFAULT_API_KEY;
 
-            const log = (msg: string) => this.outputChannel.appendLine(`[${this._ts()}] ${msg}`);
-            const openaiMessages = convertMessages(messages, filterEphemeral, log);
+		// Check if ephemeral data filtering is enabled (default: true)
+		const filterEphemeralSetting = await this.secrets.get("lemonade.filterEphemeralData");
+		const filterEphemeral = filterEphemeralSetting !== "false";
 
-			validateRequest(messages, log);
+	    const log = (msg: string) => this.outputChannel.appendLine(`[${this._ts()}] ${msg}`);
+	    const openaiMessages = convertMessages(messages, filterEphemeral, log);
 
-            const toolConfig = convertTools(options, log);
+		validateRequest(messages, log);
+
+	    const toolConfig = convertTools(options, log);
 
         if (options.tools && options.tools.length > 128) {
-            throw new Error("Cannot have more than 128 tools per request.");
-        }
+			throw new Error("Cannot have more than 128 tools per request.");
+	        }
 
-            const inputTokenCount = this.estimateMessagesTokens(messages);
-            const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
-            const tokenLimit = Math.max(1, model.maxInputTokens);
-            if (inputTokenCount + toolTokenCount > tokenLimit) {
-                this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Message exceeds token limit: ${inputTokenCount + toolTokenCount}/${tokenLimit}`);
-                throw new Error("Message exceeds token limit.");
-            }
+		    const inputTokenCount = this.estimateMessagesTokens(messages);
+		    const toolTokenCount = this.estimateToolTokens(toolConfig.tools);
+		    const tokenLimit = Math.max(1, model.maxInputTokens);
+		    if (inputTokenCount + toolTokenCount > tokenLimit) {
+				this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Message exceeds token limit: ${inputTokenCount + toolTokenCount}/${tokenLimit}`);
+				throw new Error("Message exceeds token limit.");
+		    }
 
-            const maxOutputTokens = await resolveMaxOutputTokens();
-            requestBody = {
-                model: realModelId,
-                messages: openaiMessages,
-                stream: true,
-                // Ask the server to include token usage in the final streamed
-                // chunk. Without this, OpenAI-compatible endpoints omit `usage`
-                // from the stream, so VS Code has no token stats to display.
-                stream_options: { include_usage: true },
-                max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
-                temperature: options.modelOptions?.temperature ?? 0.7,
-            };
+		    const maxOutputTokens = await resolveMaxOutputTokens();
+		    requestBody = {
+				model: realModelId,
+				messages: openaiMessages,
+				stream: true,
+				// Ask the server to include token usage in the final streamed
+				// chunk. Without this, OpenAI-compatible endpoints omit `usage`
+				// from the stream, so VS Code has no token stats to display.
+				stream_options: { include_usage: true },
+				max_tokens: Math.min(options.modelOptions?.max_tokens ?? maxOutputTokens, model.maxOutputTokens),
+				temperature: options.modelOptions?.temperature ?? 0.7,
+			};
 
-			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request: model=${realModelId}, messages=${openaiMessages.length}, max_tokens=${(requestBody as Record<string, unknown>).max_tokens}, temperature=${(requestBody as Record<string, unknown>).temperature}`);
+		this.outputChannel.appendLine(`[${this._ts()}] [INFO] Request: model=${realModelId}, messages=${openaiMessages.length}, max_tokens=${(requestBody as Record<string, unknown>).max_tokens}, temperature=${(requestBody as Record<string, unknown>).temperature}`);
 
-			// Allow-list model options
-			if (options.modelOptions) {
-				const mo = options.modelOptions as Record<string, unknown>;
-				if (typeof mo.stop === "string" || Array.isArray(mo.stop)) {
-					(requestBody as Record<string, unknown>).stop = mo.stop;
-				}
-				if (typeof mo.frequency_penalty === "number") {
-					(requestBody as Record<string, unknown>).frequency_penalty = mo.frequency_penalty;
-				}
-				if (typeof mo.presence_penalty === "number") {
-					(requestBody as Record<string, unknown>).presence_penalty = mo.presence_penalty;
-				}
+		// Allow-list model options
+		if (options.modelOptions) {
+			const mo = options.modelOptions as Record<string, unknown>;
+			if (typeof mo.stop === "string" || Array.isArray(mo.stop)) {
+				(requestBody as Record<string, unknown>).stop = mo.stop;
 			}
+			if (typeof mo.frequency_penalty === "number") {
+				(requestBody as Record<string, unknown>).frequency_penalty = mo.frequency_penalty;
+			}
+			if (typeof mo.presence_penalty === "number") {
+				(requestBody as Record<string, unknown>).presence_penalty = mo.presence_penalty;
+			}
+		}
 
-			if (toolConfig.tools) {
-				(requestBody as Record<string, unknown>).tools = toolConfig.tools;
-			}
-			if (toolConfig.tool_choice) {
-				(requestBody as Record<string, unknown>).tool_choice = toolConfig.tool_choice;
-			}
-			const controller = new AbortController();
-			    const requestTimeout = resolveRequestTimeout();
-			    const timeoutId = setTimeout(() => {
-				    this.outputChannel.appendLine(`[${this._ts()}] [WARN] HTTP request timeout (model=${model.id}, timeoutMs=${requestTimeout})`);
-				    controller.abort();
-			    }, requestTimeout);
-			    const cancellationSubscription = token.onCancellationRequested(() => {
-				    this.outputChannel.appendLine(`[${this._ts()}] [INFO] VS Code cancelled HTTP request (model=${model.id})`);
-				    controller.abort();
-			    });
-			try {
-				const response = await fetch(`${baseUrl}/chat/completions`, {
+		if (toolConfig.tools) {
+			(requestBody as Record<string, unknown>).tools = toolConfig.tools;
+		}
+		if (toolConfig.tool_choice) {
+			(requestBody as Record<string, unknown>).tool_choice = toolConfig.tool_choice;
+		}
+		const controller = new AbortController();
+			const requestTimeout = resolveRequestTimeout();
+			const timeoutId = setTimeout(() => {
+				this.outputChannel.appendLine(`[${this._ts()}] [WARN] HTTP request timeout (model=${model.id}, timeoutMs=${requestTimeout})`);
+				controller.abort();
+			}, requestTimeout);
+			const cancellationSubscription = token.onCancellationRequested(() => {
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] VS Code cancelled HTTP request (model=${model.id})`);
+				controller.abort();
+			});
+		try {
+			const response = await fetch(`${baseUrl}/chat/completions`, {
 					method: "POST",
-					headers: {
+				headers: {
 						Authorization: `Bearer ${apiKey}`,
 						"Content-Type": "application/json",
 						"User-Agent": this.userAgent,
 					},
-					body: JSON.stringify(requestBody),
-					signal: controller.signal,
-				});
+				body: JSON.stringify(requestBody),
+				signal: controller.signal,
+			});
 
-				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Response: status=${response.status} ${response.statusText}`);
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Response: status=${response.status} ${response.statusText}`);
 
-				if (!response.ok) {
-					const errorText = await response.text();
-					this.outputChannel.appendLine(`[${this._ts()}] [ERROR] API error response: ${errorText}`);
-					throw new Error(
-						`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
-					);
-				}
+			if (!response.ok) {
+				const errorText = await response.text();
+				this.outputChannel.appendLine(`[${this._ts()}] [ERROR] API error response: ${errorText}`);
+				throw new Error(
+					`Lemonade API error: ${response.status} ${response.statusText}${errorText ? `\n${errorText}` : ""}`
+				);
+			}
 
-				if (!response.body) {
-					throw new Error("No response body from Lemonade API");
-				}
-				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
-				await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration, finalUsage);
-				// Only report usage when the server actually returned token
-				// counts. VS Code reads `prompt_tokens`/`completion_tokens`
-				// (snake_case) from this part to render token stats.
-				if (this.hasUsage(finalUsage)) {
-					trackingProgress.report(new vscode.LanguageModelDataPart(
-						new TextEncoder().encode(JSON.stringify(finalUsage)),
-						'usage'
-					));
-					this.outputChannel.appendLine(`[${this._ts()}] [INFO] Reported usage: ${JSON.stringify(finalUsage)}`);
-				} else {
-					this.outputChannel.appendLine(`[${this._ts()}] [WARN] No usage data in streaming response; token stats will not be shown`);
-				}
-			} finally {
-				cancellationSubscription.dispose();
-				clearTimeout(timeoutId);
+			if (!response.body) {
+				throw new Error("No response body from Lemonade API");
+			}
+			this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
+			await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration, finalUsage);
+			// Only report usage when the server actually returned token
+			// counts. VS Code reads `prompt_tokens`/`completion_tokens`
+			// (snake_case) from this part to render token stats.
+			if (this.hasUsage(finalUsage)) {
+				trackingProgress.report(new vscode.LanguageModelDataPart(
+					new TextEncoder().encode(JSON.stringify(finalUsage)),
+					'usage'
+				));
+				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Reported usage: ${JSON.stringify(finalUsage)}`);
+			} else {
+				this.outputChannel.appendLine(`[${this._ts()}] [WARN] No usage data in streaming response; token stats will not be shown`);
 			}
 		} catch (err) {
 			const errMsg = err instanceof Error ? err.message : String(err);
@@ -484,16 +547,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 			}
 			this.outputChannel.appendLine(`[${this._ts()}] [ERROR] Chat request failed: model=${model.id}, messages=${messages.length}, error=${errMsg}`);
 			throw err;
+		} finally {
+			cancellationSubscription.dispose();
+			clearTimeout(timeoutId);
 		}
 	}
-
-	/**
-	 * Returns the number of tokens for a given text using the model specific tokenizer logic
-	 * @param model The language model to use
-	 * @param text The text to count tokens for
-	 * @param token A cancellation token for the request
-	 * @returns A promise that resolves to the number of tokens
-	 */
 	async provideTokenCount(
 		model: LanguageModelChatInformation,
 		text: string | LanguageModelChatMessage,
@@ -530,6 +588,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
         const reader = responseBody.getReader();
         const decoder = new TextDecoder();
         let buffer = "";
+        let doneReceived = false;
 
 		try {
 			while (!token.isCancellationRequested) {
@@ -556,7 +615,8 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
                         await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
                         // Flush any in-progress text-embedded tool call (silent if incomplete)
                         await this.flushActiveTextToolCall(progress);
-                        continue;
+                        doneReceived = true;
+                        return; // Stream complete — exit early to avoid extra read
                     }
 
 					try {
@@ -580,7 +640,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 						if (usage && usageAccumulator) {
 							Object.assign(usageAccumulator, usage);
 						}
-                        await this.processDelta(parsed, progress);
+						await this.processDelta(parsed, progress);
 					} catch (error) {
 						if (error instanceof SyntaxError) {
 							// Ignore malformed SSE lines until the server finishes the stream.
@@ -594,8 +654,10 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             reader.releaseLock();
             if (token.isCancellationRequested) {
                 this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stream cancelled (VS Code LM API internal cancellation)`);
+            } else if (doneReceived) {
+                this.outputChannel.appendLine(`[${this._ts()}] [INFO] Stream reader closed normally after [DONE]`);
             } else {
-                this.outputChannel.appendLine(`[${this._ts()}] [INFO] Stream reader closed (no [DONE] received)`);
+                this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stream reader closed without receiving [DONE] — response may be incomplete`);
             }
             // Clean up any leftover tool call state
             this._toolCallBuffers.clear();

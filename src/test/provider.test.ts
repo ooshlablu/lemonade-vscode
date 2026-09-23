@@ -362,6 +362,132 @@ suite("Lemonade Chat Provider Extension", () => {
 		});
 	});
 
+	suite("duplicate calls", () => {
+		test("serializes concurrent requests — second is queued until the first completes", async () => {
+			const logger = new CaptureLogger();
+			const provider = new LemonadeChatModelProvider(makeSecretStorage(), "test/test", logger);
+			const streams: ReturnType<typeof controllableStream>[] = [];
+			const originalFetch = global.fetch;
+			try {
+				(global as unknown as Record<string, unknown>).fetch = mockFetch(streams);
+
+				const text1: string[] = [];
+				const text2: string[] = [];
+				const p1 = provider.provideLanguageModelChatResponse(
+					makeTestModel(),
+					[makeUserMessage("one")],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (p: unknown) => { if (p instanceof vscode.LanguageModelTextPart) text1.push(p.value); } },
+					new vscode.CancellationTokenSource().token
+				);
+				for (let i = 0; i < 100 && streams.length < 1; i++) {
+					await sleep(5);
+				}
+				assert.equal(streams.length, 1, "request 1 should have opened a stream");
+
+				// Request 2 starts while request 1 is in flight — it must be queued.
+				const p2 = provider.provideLanguageModelChatResponse(
+					makeTestModel(),
+					[makeUserMessage("two")],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (p: unknown) => { if (p instanceof vscode.LanguageModelTextPart) text2.push(p.value); } },
+					new vscode.CancellationTokenSource().token
+				);
+				await sleep(50);
+				assert.equal(streams.length, 1, "request 2 must be queued, not open a second stream");
+				assert.ok(
+					logger.lines.some((l) => l.includes("[WARN] Request queued (another request already in-flight)")),
+					`missing queued warning:\n${logger.lines.join("\n")}`
+				);
+
+				// Complete request 1.
+				streams[0].send('data: {"choices":[{"delta":{"content":"first"}}]}\n\n');
+				streams[0].send("data: [DONE]\n\n");
+				streams[0].close();
+				await p1;
+
+				// Request 2 should now have been picked up from the queue.
+				for (let i = 0; i < 100 && streams.length < 2; i++) {
+					await sleep(5);
+				}
+				assert.equal(streams.length, 2, "request 2 should open its stream after request 1 completes");
+				streams[1].send('data: {"choices":[{"delta":{"content":"second"}}]}\n\n');
+				streams[1].send("data: [DONE]\n\n");
+				streams[1].close();
+				await p2;
+
+				const out1 = text1.join("");
+				const out2 = text2.join("");
+				assert.ok(out1.includes("first") && !out1.includes("second"), `request 1 output leaked: ${out1}`);
+				assert.ok(out2.includes("second") && !out2.includes("first"), `request 2 output leaked: ${out2}`);
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+
+		test("exits the stream reader early on [DONE] instead of reading further", async () => {
+			const logger = new CaptureLogger();
+			const provider = new LemonadeChatModelProvider(makeSecretStorage(), "test/test", logger);
+			const streams: ReturnType<typeof controllableStream>[] = [];
+			const originalFetch = global.fetch;
+			try {
+				(global as unknown as Record<string, unknown>).fetch = mockFetch(streams);
+				const text: string[] = [];
+				const p = provider.provideLanguageModelChatResponse(
+					makeTestModel(),
+					[makeUserMessage("done")],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (part: unknown) => { if (part instanceof vscode.LanguageModelTextPart) text.push(part.value); } },
+					new vscode.CancellationTokenSource().token
+				);
+				for (let i = 0; i < 100 && streams.length < 1; i++) {
+					await sleep(5);
+				}
+				streams[0].send('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n');
+				streams[0].send("data: [DONE]\n\n");
+				// Do NOT close the stream — the provider must exit on [DONE] itself.
+				await p;
+				assert.ok(text.join("").includes("ok"), "content before [DONE] should be reported");
+				assert.ok(
+					logger.lines.some((l) => l.includes("[INFO] Stream reader closed normally after [DONE]")),
+					`missing early-exit log:\n${logger.lines.join("\n")}`
+				);
+			} finally {
+				streams.forEach((s) => s.close());
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+
+		test("logs a warning when the stream closes without [DONE]", async () => {
+			const logger = new CaptureLogger();
+			const provider = new LemonadeChatModelProvider(makeSecretStorage(), "test/test", logger);
+			const streams: ReturnType<typeof controllableStream>[] = [];
+			const originalFetch = global.fetch;
+			try {
+				(global as unknown as Record<string, unknown>).fetch = mockFetch(streams);
+				const p = provider.provideLanguageModelChatResponse(
+					makeTestModel(),
+					[makeUserMessage("trunc")],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: () => {} },
+					new vscode.CancellationTokenSource().token
+				);
+				for (let i = 0; i < 100 && streams.length < 1; i++) {
+					await sleep(5);
+				}
+				streams[0].send('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n');
+				streams[0].close(); // no [DONE]
+				await p;
+				assert.ok(
+					logger.lines.some((l) => l.includes("[WARN] Stream reader closed without receiving [DONE]")),
+					`missing incomplete-stream warning:\n${logger.lines.join("\n")}`
+				);
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+	});
+
 	suite("provider", () => {
 		test("prepareLanguageModelChatInformation returns array", async () => {
 			const provider = new LemonadeChatModelProvider({
