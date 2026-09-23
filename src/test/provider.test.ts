@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { LemonadeChatModelProvider } from "../provider";
 import { convertMessages, convertTools, validateRequest, validateTools, tryParseJSONObject } from "../utils";
 import type { LemonadeEndpoint } from "../types";
+import type { Logger } from "../logger";
 
 interface OpenAIToolCall {
 	id: string;
@@ -17,7 +18,210 @@ interface ConvertedMessage {
 	tool_call_id?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Shared helpers for streaming-based provider tests
+// ---------------------------------------------------------------------------
+
+/** In-memory Logger that records every line it receives. */
+class CaptureLogger implements Logger {
+	lines: string[] = [];
+	appendLine(message: string): void {
+		this.lines.push(message);
+	}
+	show(): void {}
+	hide(): void {}
+	dispose(): void {}
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function makeSecretStorage(): vscode.SecretStorage {
+	return {
+		get: async () => undefined,
+		store: async () => {},
+		delete: async () => {},
+		onDidChange: (_listener: unknown) => ({ dispose() {} }),
+	} as unknown as vscode.SecretStorage;
+}
+
+function makeTestModel(): vscode.LanguageModelChatInformation {
+	return {
+		id: "m",
+		name: "m",
+		family: "lemonade",
+		version: "1.0.0",
+		maxInputTokens: 1000,
+		maxOutputTokens: 1000,
+		capabilities: {},
+	} as unknown as vscode.LanguageModelChatInformation;
+}
+
+function makeUserMessage(text: string): vscode.LanguageModelChatMessage {
+	return {
+		role: vscode.LanguageModelChatMessageRole.User,
+		content: [new vscode.LanguageModelTextPart(text)],
+		name: undefined,
+	};
+}
+
+/** A ReadableStream whose chunks we control from the outside. */
+function controllableStream(): {
+	body: ReadableStream<Uint8Array>;
+	send: (s: string) => void;
+	close: () => void;
+} {
+	const encoder = new TextEncoder();
+	let enq: (c: Uint8Array) => void = () => {};
+	let cls: () => void = () => {};
+	const body = new ReadableStream<Uint8Array>({
+		start(controller) {
+			enq = (c) => controller.enqueue(c);
+			cls = () => controller.close();
+		},
+	});
+	return { body, send: (s) => enq(encoder.encode(s)), close: () => cls() };
+}
+
+/** Build a fetch mock: /models returns an empty list, /chat/completions returns a fresh controllable stream. */
+function mockFetch(streams: ReturnType<typeof controllableStream>[]): unknown {
+	return async (input: RequestInfo | URL) => {
+		const url = String(input);
+		if (url.endsWith("/models")) {
+			return { ok: true, json: async () => ({ object: "list", data: [] }) };
+		}
+		const s = controllableStream();
+		streams.push(s);
+		return { ok: true, status: 200, statusText: "OK", body: s.body, text: async () => "" };
+	};
+}
+
 suite("Lemonade Chat Provider Extension", () => {
+	suite("double model call", () => {
+		test("discards a stale streaming response after a new request starts", async () => {
+			const logger = new CaptureLogger();
+			const provider = new LemonadeChatModelProvider(makeSecretStorage(), "test/test", logger);
+			const streams: ReturnType<typeof controllableStream>[] = [];
+			const originalFetch = global.fetch;
+			try {
+				(global as unknown as Record<string, unknown>).fetch = mockFetch(streams);
+
+				// Request 1: start but do not complete — it parks on reader.read().
+				const parts1: unknown[] = [];
+				const p1 = provider.provideLanguageModelChatResponse(
+					makeTestModel(),
+					[makeUserMessage("one")],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (p: unknown) => parts1.push(p) },
+					new vscode.CancellationTokenSource().token
+				);
+				for (let i = 0; i < 50 && streams.length < 1; i++) {
+					await sleep(5);
+				}
+				assert.equal(streams.length, 1, "request 1 should have opened a stream");
+
+				// Request 2: starts while request 1 is in-flight. Depending on the
+				// provider version it either runs concurrently (advancing the request
+				// generation) or is queued behind request 1; both are valid — what
+				// must hold in both cases is that request 1's leftover stream data is
+				// never emitted to request 1's progress.
+				const parts2: unknown[] = [];
+				const p2 = provider.provideLanguageModelChatResponse(
+					makeTestModel(),
+					[makeUserMessage("two")],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (p: unknown) => parts2.push(p) },
+					new vscode.CancellationTokenSource().token
+				);
+
+			// Give request 2 a moment to open its own stream (concurrent mode).
+			// If it does not within this window, it is queued behind request 1.
+			let concurrent = false;
+			for (let i = 0; i < 100 && streams.length < 2; i++) {
+				await sleep(5);
+				if (streams.length === 2) {
+					concurrent = true;
+					break;
+				}
+			}
+
+			if (!concurrent) {
+					// Request 2 is queued behind request 1: complete request 1 first.
+					streams[0].send('data: {"choices":[{"delta":{"content":"one"}}]}\n\n');
+					streams[0].send('data: [DONE]\n\n');
+					streams[0].close();
+					await p1;
+					for (let i = 0; i < 50 && streams.length < 2; i++) {
+						await sleep(5);
+					}
+					assert.equal(streams.length, 2, "queued request 2 should start after request 1 completes");
+					streams[1].send('data: {"choices":[{"delta":{"content":"two"}}]}\n\n');
+					streams[1].send('data: [DONE]\n\n');
+					streams[1].close();
+					await p2;
+					assert.ok(
+						logger.lines.some((l) => l.includes("[WARN] Request queued (another request already in-flight)")),
+						`missing queued warning:\n${logger.lines.join("\n")}`
+					);
+				} else {
+					// Request 2 opened its own stream: complete it, then feed request 1
+					// leftover data which must be treated as stale and discarded.
+					streams[1].send('data: {"choices":[{"delta":{"content":"two"}}]}\n\n');
+					streams[1].send('data: [DONE]\n\n');
+					streams[1].close();
+					await p2;
+
+					streams[0].send('data: {"choices":[{"delta":{"content":"STALE"}}]}\n\n');
+					streams[0].send('data: [DONE]\n\n');
+					streams[0].close();
+					await p1;
+					assert.ok(
+						logger.lines.some((l) => l.includes("[DONE] Stale request discarded")),
+						`missing stale [DONE] log:\n${logger.lines.join("\n")}`
+					);
+				}
+
+				// In neither mode may request 1's progress have received the stale text.
+				const staleEmitted = parts1.some(
+					(p) => p instanceof vscode.LanguageModelTextPart && (p as vscode.LanguageModelTextPart).value === "STALE"
+				);
+				assert.ok(!staleEmitted, "stale chunk must be discarded, not emitted");
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+
+		test("emits a normal (non-stale) response when no newer request exists", async () => {
+			const provider = new LemonadeChatModelProvider(makeSecretStorage(), "test/test", new CaptureLogger());
+			const streams: ReturnType<typeof controllableStream>[] = [];
+			const originalFetch = global.fetch;
+			try {
+				(global as unknown as Record<string, unknown>).fetch = mockFetch(streams);
+				const parts: unknown[] = [];
+				const p = provider.provideLanguageModelChatResponse(
+					makeTestModel(),
+					[makeUserMessage("solo")],
+					{} as unknown as vscode.LanguageModelChatRequestHandleOptions,
+					{ report: (p: unknown) => parts.push(p) },
+					new vscode.CancellationTokenSource().token
+				);
+				for (let i = 0; i < 50 && streams.length < 1; i++) {
+					await sleep(5);
+				}
+				streams[0].send('data: {"choices":[{"delta":{"content":"solo"}}]}\n\n');
+				streams[0].send('data: [DONE]\n\n');
+				streams[0].close();
+				await p;
+
+				const textEmitted = parts.some(
+					(p) => p instanceof vscode.LanguageModelTextPart && (p as vscode.LanguageModelTextPart).value === "solo"
+				);
+				assert.ok(textEmitted, "a single request's text should be emitted");
+			} finally {
+				(global as unknown as Record<string, unknown>).fetch = originalFetch;
+			}
+		});
+	});
+
 	suite("provider", () => {
 		test("prepareLanguageModelChatInformation returns array", async () => {
 			const provider = new LemonadeChatModelProvider({

@@ -72,6 +72,15 @@ function resolveRequestTimeout(): number {
  * VS Code Chat provider backed by Lemonade local LLM server.
  */
 export class LemonadeChatModelProvider implements LanguageModelChatProvider {
+	/** Monotonically increasing counter to detect stale requests. Each call to
+	 *  `provideLanguageModelChatResponse` captures the current generation; any
+	 *  streaming response whose generation no longer matches the latest is
+	 *  discarded. */
+	private _requestGeneration = 0;
+	/** Counter for stale SSE chunks discarded in the current streaming session. Used to cap logging spam. */
+	private _staleChunkCount = 0;
+	/** Maximum number of stale chunk discard warnings to log per streaming session. */
+	private readonly _maxStaleWarnings = 5;
 	/** Buffer for assembling streamed tool calls by index. */
 	private _toolCallBuffers: Map<number, { id?: string; name?: string; args: string }> = new Map<
 		number,
@@ -301,6 +310,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 
 		this._toolCallBuffers.clear();
 		this._completedToolCallIndices.clear();
+		this._staleChunkCount = 0;
 		this._hasEmittedAssistantText = false;
 		this._emittedBeginToolCallsHint = false;
         this._textToolParserBuffer = "";
@@ -308,6 +318,11 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
         this._emittedTextToolCallKeys.clear();
         this._emittedTextToolCallIds.clear();
 		this._controlTokenBuffer = "";
+
+		// Capture the current generation — if the user switches models VS Code
+		// will start a new request with a new generation; responses from the
+		// old request are discarded via processStreamingResponse.
+		const currentGeneration = ++this._requestGeneration;
 
 		let requestBody: Record<string, unknown> | undefined;
 		const trackingProgress: Progress<LanguageModelResponsePart> = {
@@ -423,7 +438,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 					throw new Error("No response body from Lemonade API");
 				}
 				this.outputChannel.appendLine(`[${this._ts()}] [INFO] Starting streaming response for model ${realModelId}`);
-				await this.processStreamingResponse(response.body, trackingProgress, token);
+				await this.processStreamingResponse(response.body, trackingProgress, token, currentGeneration);
 			} finally {
 				cancellationSubscription.dispose();
 				clearTimeout(timeoutId);
@@ -471,11 +486,14 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 	 * @param responseBody The readable stream body.
 	 * @param progress Progress reporter for streamed parts.
 	 * @param token Cancellation token.
+	 * @param generation The request generation captured at call start. Responses from
+	 *   older generations (stale requests from model switches) are discarded.
 	 */
     private async processStreamingResponse(
         responseBody: ReadableStream<Uint8Array>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken,
+        generation: number,
     ): Promise<void> {
         const reader = responseBody.getReader();
         const decoder = new TextDecoder();
@@ -496,6 +514,12 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 					}
 					const data = line.slice(6);
                     if (data === "[DONE]") {
+                        // Check if this request is still the active one
+                        if (generation !== this._requestGeneration) {
+                            this.outputChannel.appendLine(`[${this._ts()}] [WARN] [DONE] Stale request discarded (generation ${generation} vs current ${this._requestGeneration})`);
+                            return; // Stale — discard entirely
+                        }
+                        this.outputChannel.appendLine(`[${this._ts()}] [INFO] Stream completed with [DONE]`);
                         // Do not throw on [DONE]; any incomplete/empty buffers are ignored.
                         await this.flushToolCallBuffers(progress, /*throwOnInvalid*/ false);
                         // Flush any in-progress text-embedded tool call (silent if incomplete)
@@ -508,6 +532,16 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
 						const error = parsed.error as Record<string, unknown> | undefined;
 						if (error && typeof error.message === "string") {
 							throw new Error(`Lemonade streaming error: ${error.message}`);
+						}
+						// Discard responses from stale requests (model was switched mid-stream)
+						if (generation !== this._requestGeneration) {
+							this._staleChunkCount++;
+							if (this._staleChunkCount <= this._maxStaleWarnings) {
+								this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stale SSE chunk discarded (generation ${generation} vs current ${this._requestGeneration})`);
+							} else if (this._staleChunkCount === this._maxStaleWarnings + 1) {
+								this.outputChannel.appendLine(`[${this._ts()}] [WARN] Stale SSE chunk discard count exceeded ${this._maxStaleWarnings}; suppressing further warnings`);
+							}
+							continue;
 						}
                         await this.processDelta(parsed, progress);
 					} catch (error) {
@@ -529,6 +563,7 @@ export class LemonadeChatModelProvider implements LanguageModelChatProvider {
             // Clean up any leftover tool call state
             this._toolCallBuffers.clear();
             this._completedToolCallIndices.clear();
+            this._staleChunkCount = 0;
             this._hasEmittedAssistantText = false;
             this._emittedBeginToolCallsHint = false;
             this._textToolParserBuffer = "";
